@@ -173,4 +173,4 @@ def run_subtitle_ocr_for_timestamp(
 
 
 if __name__ == "__main__":
-    run_subtitle_ocr_for_timestamp("./data/01/vid.mp4", 613, score_threshold=0.5)
+    run_subtitle_ocr_for_timestamp("./data/01/vid.mp4", 112, score_threshold=0.5)
