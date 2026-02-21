@@ -1,7 +1,7 @@
-import json
 from pathlib import Path
 
 import cv2
+import numpy as np
 from paddleocr import PaddleOCR
 
 
@@ -33,9 +33,11 @@ def preprocess_for_subtitle_ocr(
     image_path_str: str,
     bottom_ratio: float = 0.30,  # keep bottom 30% of image
     center_width_ratio: float = 0.90,  # keep center 90% width
-    contrast_alpha: float = 1.8,  # contrast multiplier (1.0 = no change)
-    brightness_beta: int = 10,  # brightness shift
-    use_threshold: bool = True,
+    white_v_min: int = 170,  # minimum brightness for white-ish text
+    white_s_max: int = 60,  # maximum saturation for white-ish text
+    min_component_area: int = 18,  # remove tiny noise blobs
+    min_component_height: int = 10,  # remove very short blobs
+    upscale: float = 2.0,
 ) -> str:
     image_path = Path(image_path_str)
     image = cv2.imread(str(image_path))
@@ -54,22 +56,44 @@ def preprocess_for_subtitle_ocr(
 
     roi = image[y1:y2, x1:x2]
 
-    # ---- 2) Convert to grayscale ----
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    # ---- 2) Keep only white-ish pixels in HSV ----
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lower_white = np.array((0, 0, white_v_min), dtype=np.uint8)
+    upper_white = np.array((179, white_s_max, 255), dtype=np.uint8)
+    white_mask = cv2.inRange(hsv, lower_white, upper_white)
 
-    # ---- 3) Boost contrast / brightness ----
-    enhanced = cv2.convertScaleAbs(gray, alpha=contrast_alpha, beta=brightness_beta)
+    # ---- 3) Cleanup mask ----
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN, open_kernel)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, close_kernel)
 
-    # ---- 4) Light denoise (optional but often helpful) ----
-    denoised = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    # ---- 4) Keep text-like connected components ----
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        white_mask, connectivity=8
+    )
+    filtered_mask = white_mask.copy()
+    filtered_mask[:] = 0
+    for label in range(1, num_labels):  # 0 is background
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        comp_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area >= min_component_area and comp_h >= min_component_height:
+            filtered_mask[labels == label] = 255
 
-    # ---- 5) Threshold (helps subtitles stand out) ----
-    if use_threshold:
-        _, processed = cv2.threshold(
-            denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    # ---- 5) Build OCR image from filtered mask ----
+    isolated = cv2.bitwise_and(roi, roi, mask=filtered_mask)
+    gray = cv2.cvtColor(isolated, cv2.COLOR_BGR2GRAY)
+    _, processed = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # ---- 6) Upscale for better OCR on thin strokes ----
+    if upscale > 1.0:
+        processed = cv2.resize(
+            processed,
+            None,
+            fx=upscale,
+            fy=upscale,
+            interpolation=cv2.INTER_CUBIC,
         )
-    else:
-        processed = denoised
 
     if image_path.parent.name == "frames":
         video_dir = image_path.parent.parent
@@ -83,7 +107,9 @@ def preprocess_for_subtitle_ocr(
     return str(processed_path)
 
 
-def extract_chinese_text(image_path_str: str) -> list[str]:
+def extract_chinese_text(
+    image_path_str: str, score_threshold: float = 0.5
+) -> list[str]:
     ocr = PaddleOCR(
         lang="ch",
         use_doc_orientation_classify=False,
@@ -93,25 +119,31 @@ def extract_chinese_text(image_path_str: str) -> list[str]:
     results = ocr.predict(input=image_path_str)
     texts: list[str] = []
     for res in results:
-        data = res.json if hasattr(res, "json") else res
-        if isinstance(data, str):
-            data = json.loads(data)
-        if isinstance(data, dict):
-            texts.extend(data.get("rec_texts", []))
+        payload = res if isinstance(res, dict) else {}
+        rec_texts = payload.get("rec_texts", [])
+        rec_scores = payload.get("rec_scores", [])
+
+        if not rec_scores:
+            texts.extend(rec_texts)
+            continue
+
+        for text, score in zip(rec_texts, rec_scores):
+            if score is not None and float(score) >= score_threshold:
+                texts.append(text)
     return texts
 
 
 def run_subtitle_ocr_for_timestamp(
-    video_path_str: str, timestamp_sec: float
+    video_path_str: str, timestamp_sec: float, score_threshold: float = 0.5
 ) -> list[str]:
     frame_path = write_image(video_path_str, timestamp_sec)
     processed_path = preprocess_for_subtitle_ocr(
         frame_path, bottom_ratio=0.15, center_width_ratio=0.5
     )
-    texts = extract_chinese_text(processed_path)
+    texts = extract_chinese_text(processed_path, score_threshold=score_threshold)
     print(f"OCR text @ {timestamp_sec}s: {texts}")
     return texts
 
 
 if __name__ == "__main__":
-    run_subtitle_ocr_for_timestamp("./data/01/vid.mp4", 217.4)
+    run_subtitle_ocr_for_timestamp("./data/01/vid.mp4", 217.4, score_threshold=0.5)
