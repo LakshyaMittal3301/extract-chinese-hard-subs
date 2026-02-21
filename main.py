@@ -1,11 +1,22 @@
 from pathlib import Path
+from functools import lru_cache
 
 import cv2
 import numpy as np
 from paddleocr import PaddleOCR
 
 
-def write_image(video_path_str: str, timestamp_sec: float) -> str:
+@lru_cache(maxsize=1)
+def get_ocr_model() -> PaddleOCR:
+    return PaddleOCR(
+        lang="ch",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+
+
+def extract_frame(video_path_str: str, timestamp_sec: float) -> tuple[np.ndarray, str]:
     timestamp_msec = int(round(timestamp_sec * 1000))
     video_path = Path(video_path_str)
     frames_dir = video_path.parent / "frames"
@@ -26,11 +37,12 @@ def write_image(video_path_str: str, timestamp_sec: float) -> str:
 
     cv2.imwrite(str(frame_path), frame)
     print(f"Saved frame: {frame_path}")
-    return str(frame_path)
+    return frame, str(frame_path)
 
 
 def preprocess_for_subtitle_ocr(
-    image_path_str: str,
+    image: np.ndarray,
+    source_frame_path: str,
     bottom_ratio: float = 0.30,  # keep bottom 30% of image
     center_width_ratio: float = 0.90,  # keep center 90% width
     white_v_min: int = 170,  # minimum brightness for white-ish text
@@ -38,12 +50,8 @@ def preprocess_for_subtitle_ocr(
     min_component_area: int = 18,  # remove tiny noise blobs
     min_component_height: int = 10,  # remove very short blobs
     upscale: float = 2.0,
-) -> str:
-    image_path = Path(image_path_str)
-    image = cv2.imread(str(image_path))
-    if image is None:
-        raise RuntimeError(f"Could not read image: {image_path}")
-
+) -> tuple[np.ndarray, str]:
+    image_path = Path(source_frame_path)
     h, w = image.shape[:2]
 
     # ---- 1) Crop bottom-center region ----
@@ -104,46 +112,65 @@ def preprocess_for_subtitle_ocr(
     processed_path = processed_dir / image_path.name
     cv2.imwrite(str(processed_path), processed)
     print(f"Saved processed frame: {processed_path}")
-    return str(processed_path)
+    return processed, str(processed_path)
 
 
 def extract_chinese_text(
-    image_path_str: str, score_threshold: float = 0.5
-) -> list[str]:
-    ocr = PaddleOCR(
-        lang="ch",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-    )
-    results = ocr.predict(input=image_path_str)
-    texts: list[str] = []
+    processed_image: np.ndarray, score_threshold: float = 0.5
+) -> tuple[str, float]:
+    if processed_image.ndim == 2:
+        ocr_input = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
+    elif processed_image.ndim == 3 and processed_image.shape[2] == 1:
+        ocr_input = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
+    else:
+        ocr_input = processed_image
+
+    results = get_ocr_model().predict(input=ocr_input)
+    kept_texts: list[str] = []
+    kept_scores: list[float] = []
     for res in results:
         payload = res if isinstance(res, dict) else {}
+
         rec_texts = payload.get("rec_texts", [])
         rec_scores = payload.get("rec_scores", [])
 
         if not rec_scores:
-            texts.extend(rec_texts)
+            kept_texts.extend(rec_texts)
+            kept_scores.extend([1.0] * len(rec_texts))
             continue
 
         for text, score in zip(rec_texts, rec_scores):
             if score is not None and float(score) >= score_threshold:
-                texts.append(text)
-    return texts
+                kept_texts.append(text)
+                kept_scores.append(float(score))
+
+    merged_text = "".join(kept_texts)
+    confidence = sum(kept_scores) / len(kept_scores) if kept_scores else 0.0
+    return merged_text, confidence
 
 
 def run_subtitle_ocr_for_timestamp(
     video_path_str: str, timestamp_sec: float, score_threshold: float = 0.5
-) -> list[str]:
-    frame_path = write_image(video_path_str, timestamp_sec)
-    processed_path = preprocess_for_subtitle_ocr(
-        frame_path, bottom_ratio=0.15, center_width_ratio=0.5
+) -> dict[str, float | str]:
+    frame, frame_path = extract_frame(video_path_str, timestamp_sec)
+    processed_image, _ = preprocess_for_subtitle_ocr(
+        frame, frame_path, bottom_ratio=0.15, center_width_ratio=0.5
     )
-    texts = extract_chinese_text(processed_path, score_threshold=score_threshold)
-    print(f"OCR text @ {timestamp_sec}s: {texts}")
-    return texts
+    merged_text, confidence = extract_chinese_text(
+        processed_image, score_threshold=score_threshold
+    )
+
+    result: dict[str, float | str] = {
+        "timestamp_sec": float(timestamp_sec),
+        "text": merged_text,
+        "confidence": confidence,
+    }
+    print(f"OCR result @ {timestamp_sec}s: {result}")
+
+    del frame
+    del processed_image
+    return result
 
 
 if __name__ == "__main__":
-    run_subtitle_ocr_for_timestamp("./data/01/vid.mp4", 217.4, score_threshold=0.5)
+    run_subtitle_ocr_for_timestamp("./data/01/vid.mp4", 613, score_threshold=0.5)
