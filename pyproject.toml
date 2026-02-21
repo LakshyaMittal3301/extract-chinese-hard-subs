@@ -1,0 +1,11 @@
+[project]
+name = "extracting-chinese-hard-subs"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "opencv-python>=4.13.0.92",
+    "paddleocr>=3.4.0",
+    "paddlepaddle>=3.3.0",
+]
