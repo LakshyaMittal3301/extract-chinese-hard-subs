@@ -411,8 +411,8 @@ def run_subtitle_ocr_for_timestamp(
 if __name__ == "__main__":
     sample_results = run_subtitle_ocr_for_range(
         video_path_str="./data/01/vid.mp4",
-        start_sec=613,
-        end_sec=620,
+        start_sec=90,
+        end_sec=200,
         frequency=5,
         score_threshold=0.5,
         debug=False,
